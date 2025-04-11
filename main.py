@@ -17,7 +17,7 @@ import logging
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_TOKEN = os.getenv("GEMINI_API_KEY")
-WEBHOOK_URL_BASE = "https://mybot.up.railway.app"
+WEBHOOK_URL_BASE = "https://albertaitelegrambot-production.up.railway.app"
 WEBHOOK_URL_PATH = f"/{BOT_TOKEN}/"
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -34,7 +34,7 @@ generation_config = {
     "max_output_tokens": 8192,
 }
 model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
+    model_name="gemini-2.0-flash",
     generation_config=generation_config,
     system_instruction="You are Albert a distinguished astrophysicist, author, and science communicator...",
 )
