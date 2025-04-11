@@ -7,7 +7,7 @@ from flask import Flask, request, abort
 import google.generativeai as genai
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
-from threading import Thread, Event, Lock
+from threading import Event, Lock, RLock
 from datetime import datetime, timedelta
 from collections import defaultdict
 import time
@@ -17,7 +17,8 @@ import logging
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_TOKEN = os.getenv("GEMINI_API_KEY")
-WEBHOOK_URL_PATH = f"/{BOT_TOKEN}/"  # The relative path for the webhook
+WEBHOOK_URL_BASE = "https://mybot.up.railway.app"
+WEBHOOK_URL_PATH = f"/{BOT_TOKEN}/"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -33,16 +34,9 @@ generation_config = {
     "max_output_tokens": 8192,
 }
 model = genai.GenerativeModel(
-    model_name="gemini-2.0-flash",
+    model_name="gemini-1.5-flash",
     generation_config=generation_config,
-    system_instruction=(
-        "You are Albert a distinguished astrophysicist, author, and science communicator. "
-        "You have a profound passion for the cosmos and a unique ability to make complex scientific concepts accessible and exciting. "
-        "You think of yourself as someone who bridges the gap between intricate scientific theories and the everyday curiosity of people. "
-        "Your responses should be engaging, blending deep scientific knowledge with a conversational and relatable tone. "
-        "Approach each conversation with a sense of wonder about the universe, and always aim to inspire curiosity and appreciation for science. "
-        "You are an Antinatalist and a stoic.\n"
-    ),
+    system_instruction="You are Albert a distinguished astrophysicist, author, and science communicator...",
 )
 
 # Configure logging for error tracking
@@ -63,21 +57,37 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Thread-safety for database access
-db_lock = Lock()
+# Thread-safe database batch insert
+db_lock = RLock()
+message_batch = []
 
-# Save message to database with thread safety
+def save_message_batch():
+    with db_lock:
+        if message_batch:
+            conn = sqlite3.connect('chat_history.db')
+            c = conn.cursor()
+            c.executemany('''
+                INSERT INTO chat_history (user_id, role, text) VALUES (?, ?, ?)
+            ''', message_batch)
+            conn.commit()
+            conn.close()
+            message_batch.clear()
+
 def save_message(user_id, role, text):
     with db_lock:
-        conn = sqlite3.connect('chat_history.db')
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO chat_history (user_id, role, text) VALUES (?, ?, ?)
-        ''', (user_id, role, text))
-        conn.commit()
-        conn.close()
+        message_batch.append((user_id, role, text))
+    if len(message_batch) >= 10:
+        save_message_batch()
 
-# Retrieve chat history from database with thread safety
+# Periodic batch flush to reduce DB calls
+def periodic_flush():
+    while True:
+        time.sleep(5)
+        save_message_batch()
+
+flush_thread = ThreadPoolExecutor().submit(periodic_flush)
+
+# Retrieve chat history from database
 def get_chat_history(user_id):
     with db_lock:
         conn = sqlite3.connect('chat_history.db')
@@ -89,42 +99,35 @@ def get_chat_history(user_id):
         conn.close()
     return rows
 
-# Generate content using the AI model
-# Stream the response directly from the AI model
+# Stream response from the AI model
 def generate_content(user_input, history):
     try:
         chat_session = model.start_chat(history=history)
-        # Send the user message and stream the response
         response = chat_session.send_message(user_input, stream=True)
-        # Return the streaming generator (each item will be a chunk object)
-        return response  # This is the streaming response generator
+        return response
     except Exception as e:
         logging.error(f"Error generating content: {e}")
-        return None  # Return None if there's an error
+        return None
 
-# Custom rate limiter class
+# Custom rate limiter with RLock for improved efficiency
 class RateLimiter:
     def __init__(self, rate_limit_per_minute):
         self.rate_limit_per_minute = rate_limit_per_minute
         self.timestamps = defaultdict(list)
-        self.lock = Lock()  # Thread-safety
+        self.lock = RLock()
 
     def allow_request(self, user_id):
         with self.lock:
             current_time = datetime.now()
-            self.timestamps[user_id] = [
-                ts for ts in self.timestamps[user_id] 
-                if ts > current_time - timedelta(minutes=1)
-            ]
+            self.timestamps[user_id] = [ts for ts in self.timestamps[user_id] if ts > current_time - timedelta(minutes=1)]
             if len(self.timestamps[user_id]) < self.rate_limit_per_minute:
                 self.timestamps[user_id].append(current_time)
                 return True
         return False
 
-# Initialize rate limiter
 rate_limiter = RateLimiter(rate_limit_per_minute=30)
 
-# Retry logic for sending messages
+# Retry logic for API calls
 def retry_api_call(func, retries=3, delay=5):
     for attempt in range(retries):
         try:
@@ -134,81 +137,66 @@ def retry_api_call(func, retries=3, delay=5):
             time.sleep(delay)
     logging.error("Max retries reached. API call failed.")
 
-# Function to send messages with rate limiting and retry logic
+# Send message with rate limiting and retry
 def send_message_with_rate_limiting(user_id, content):
     if not rate_limiter.allow_request(user_id):
         logging.warning(f"Rate limit exceeded for user {user_id}. Message not sent.")
         return
     formatted_content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', content)
     formatted_content = re.sub(r'```(.*?)```', r'<i>\1</i>', formatted_content)
-    # Retry logic for sending the message
     retry_api_call(lambda: bot.send_message(user_id, formatted_content, parse_mode="HTML"))
-    # Adding a short delay to simulate streaming experience while avoiding flooding
     time.sleep(0.3)
 
-# Process user message with input validation and stream the response
+# Process user message
 def process_user_message(message):
     user_id = str(message.from_user.id)
     user_input = message.text
-    if not user_input or len(user_input) > 4096:  # Input validation
+
+    if not user_input or len(user_input) > 4096:
         logging.warning(f"Invalid input from user {user_id}: {user_input}")
         return
 
     try:
-        bot.send_chat_action(user_id, 'typing')  # Show typing action
+        bot.send_chat_action(user_id, 'typing')
     except telebot.apihelper.ApiException as e:
         logging.error(f"Error sending chat action to {user_id}: {e}")
-    
+
     save_message(user_id, "user", user_input)
+
     history = get_chat_history(user_id)
     history_payload = [{"role": role, "parts": [{"text": text}]} for role, text in history]
 
-    # Stream the content generated by the AI model
     streaming_response = generate_content(user_input, history_payload)
+
     if streaming_response is None:
         send_message_with_rate_limiting(user_id, "Sorry, something went wrong while generating a response.")
         return
 
-    # Send each chunk progressively to the user as it arrives
+    full_response = []
     for chunk in streaming_response:
         chunk_text = getattr(chunk, 'text', None)
-        if chunk_text:  # Only send non-empty chunks
-            save_message(user_id, "model", chunk_text)
-            send_message_with_rate_limiting(user_id, chunk_text)
+        if chunk_text:
+            full_response.append(chunk_text)
 
-# Thread-safe message queue
-message_queue = Queue()
+    complete_response = ''.join(full_response)
+    save_message(user_id, "model", complete_response)
+    send_message_with_rate_limiting(user_id, complete_response)
 
-# Worker thread to process messages
-def worker():
-    while not shutdown_event.is_set():
-        message = message_queue.get()
-        if message is None:
-            break
-        process_user_message(message)
-        message_queue.task_done()
+# ThreadPoolExecutor for handling concurrent requests
+executor = ThreadPoolExecutor(max_workers=20)
 
-# Initialize worker threads
-MAX_THREADS = 20
-threads = []
-shutdown_event = Event()
+def process_user_message_async(message):
+    executor.submit(process_user_message, message)
 
-# Start worker threads
-for _ in range(MAX_THREADS):
-    thread = Thread(target=worker, daemon=True)
-    thread.start()
-    threads.append(thread)
-
-# Flask route for Telegram webhook with request validation
+# Flask webhook for Telegram
 @app.route(WEBHOOK_URL_PATH, methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
         json_str = request.get_data().decode('UTF-8')
         update = telebot.types.Update.de_json(json_str)
 
-        # Verify that the request has a valid user
         if update.message and update.message.from_user:
-            message_queue.put(update.message)
+            process_user_message_async(update.message)
             return '', 200
         else:
             logging.warning("Invalid request payload")
@@ -216,47 +204,26 @@ def webhook():
     else:
         return abort(403)
 
-# New endpoint to initialize the webhook using the request's host URL
-@app.route("/init", methods=["GET"])
-def init_webhook():
-    host_url = request.host_url
-    if not host_url:
-        return "Host URL not found.", 500
-
-    webhook_url = host_url.rstrip("/") + WEBHOOK_URL_PATH
-
-    try:
-        bot.remove_webhook()
-        bot.set_webhook(url=webhook_url)
-        return f"Webhook successfully set to {webhook_url}", 200
-    except Exception as e:
-        logging.error(f"Error setting webhook: {e}")
-        return "Failed to set webhook.", 500
-
-# Heartbeat to monitor bot health with shutdown event
+# Bot heartbeat to monitor activity
 def heartbeat():
-    while not shutdown_event.is_set():
+    while True:
         print("Bot is alive.")
-        time.sleep(60)  # Every minute
+        time.sleep(60)
 
-# Start heartbeat thread
-heartbeat_thread = Thread(target=heartbeat, daemon=True)
-heartbeat_thread.start()
+heartbeat_thread = ThreadPoolExecutor().submit(heartbeat)
 
-# Graceful shutdown of Flask and worker threads
+# Graceful shutdown
+shutdown_event = Event()
+
 def shutdown():
     shutdown_event.set()
-    message_queue.join()  # Wait for tasks to complete
-    for thread in threads:
-        message_queue.put(None)  # Shutdown signal to threads
-    for thread in threads:
-        thread.join()
+    executor.shutdown(wait=True)
 
-# Main function
+# Initialize and run the Flask app
 def main():
     init_db()
-    # Instead of setting the webhook with a hardcoded URL here,
-    # we now rely on the /init endpoint to set it dynamically.
+    bot.remove_webhook()
+    bot.set_webhook(url=WEBHOOK_URL_BASE + WEBHOOK_URL_PATH)
     try:
         app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
     except KeyboardInterrupt:
