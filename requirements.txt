@@ -2,3 +2,4 @@ flask
 python-dotenv
 pyTelegramBotAPI
 google-generativeai
+redis
